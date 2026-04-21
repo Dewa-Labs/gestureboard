@@ -28,6 +28,9 @@ class DrawingMgr {
     // ─── Visual effect state ────────────────────────────────
     this._eraseFlash = null;   // { startTime, duration }
     this._snapActive = false;  // true when cursor is near draft origin
+    this._smartShapesEnabled = false;
+    this._architectModeEnabled = false;
+    this._onStateChange = null;
 
     this._resize();
     window.addEventListener('resize', () => this._resize());
@@ -46,6 +49,21 @@ class DrawingMgr {
       this.inDraft = true;
       this.draft   = [];
     }
+
+    if (this._architectModeEnabled && this.draft.length) {
+      const prev = this.draft[this.draft.length - 1];
+      const dx = wx - prev.x;
+      const dy = wy - prev.y;
+      const dist = Math.hypot(dx, dy);
+      if (dist > 0) {
+        const step = Config.ANGLE_SNAP_DEG * Math.PI / 180;
+        const angle = Math.atan2(dy, dx);
+        const snapped = Math.round(angle / step) * step;
+        wx = prev.x + Math.cos(snapped) * dist;
+        wy = prev.y + Math.sin(snapped) * dist;
+      }
+    }
+
     const last = this.draft[this.draft.length - 1];
     if (!last || Math.hypot(wx - last.x, wy - last.y) > Config.MIN_MOVE) {
       this.draft.push({ x: wx, y: wy });
@@ -53,16 +71,27 @@ class DrawingMgr {
   }
 
   /** Close the draft into a finalized polygon (if enough vertices). */
-  finalizeDraft() {
-    if (this.draft.length >= Config.MIN_VERTS) {
+  finalizeDraft(meta = {}) {
+    const source = meta.source || 'generic';
+    const confidence = meta.confidence ?? 0;
+    const smartShapeEligible = this._smartShapesEnabled
+      && source === 'peace'
+      && confidence >= Config.SHAPE_CONFIDENCE_MIN;
+    const minVerts = smartShapeEligible ? 2 : Config.MIN_VERTS;
+
+    if (this.draft.length >= minVerts) {
       this._saveUndo();
       const p = currentPalette();
+      const shaped = smartShapeEligible
+        ? this._fitSmartShape(this.draft)
+        : { pts: this._smoothClosed(this.draft), open: false, noFill: false };
       this.polygons.push({
-        pts:    [...this.draft],
+        pts:    shaped.pts,
         stroke: p.stroke,
-        fill:   p.fill,
-        open:   true,   // never auto-close the path
+        fill:   shaped.noFill ? 'rgba(0,0,0,0)' : p.fill,
+        open:   shaped.open,
       });
+      this._emitStateChange();
     }
     this.draft       = [];
     this.inDraft     = false;
@@ -76,6 +105,53 @@ class DrawingMgr {
     this._snapActive = false;
   }
 
+  setSmartShapesEnabled(enabled) {
+    this._smartShapesEnabled = Boolean(enabled);
+  }
+
+  setArchitectModeEnabled(enabled) {
+    this._architectModeEnabled = Boolean(enabled);
+  }
+
+  get smartShapesEnabled() {
+    return this._smartShapesEnabled;
+  }
+
+  get architectModeEnabled() {
+    return this._architectModeEnabled;
+  }
+
+
+  onStateChange(handler) {
+    this._onStateChange = typeof handler === 'function' ? handler : null;
+  }
+
+  exportState() {
+    return {
+      polygons: structuredClone(this.polygons),
+      smartShapesEnabled: this._smartShapesEnabled,
+      architectModeEnabled: this._architectModeEnabled,
+    };
+  }
+
+  importState(state = {}) {
+    if (!Array.isArray(state.polygons)) return;
+    this.polygons = structuredClone(state.polygons);
+    this.cancelDraft();
+
+    if (typeof state.smartShapesEnabled === 'boolean') {
+      this._smartShapesEnabled = state.smartShapesEnabled;
+    }
+    if (typeof state.architectModeEnabled === 'boolean') {
+      this._architectModeEnabled = state.architectModeEnabled;
+    }
+  }
+
+  _emitStateChange() {
+    if (!this._onStateChange) return;
+    this._onStateChange(this.exportState());
+  }
+
   // ══════════════════════════════════════════════
   //  UNDO / ERASE
   // ══════════════════════════════════════════════
@@ -84,6 +160,7 @@ class DrawingMgr {
   undo() {
     if (this.undoStack.length) {
       this.polygons   = this.undoStack.pop();
+      this._emitStateChange();
     }
     this.cancelDraft();
   }
@@ -93,6 +170,7 @@ class DrawingMgr {
     this._saveUndo();
     this.polygons   = [];
     this.cancelDraft();
+    this._emitStateChange();
   }
 
   /** Trigger an animated red flash effect over the canvas. */
@@ -380,6 +458,191 @@ class DrawingMgr {
       ctx.stroke();
       ctx.setLineDash([]);
     }
+  }
+
+  _fitSmartShape(rawPts) {
+    const closed = this._prepareClosed(rawPts);
+    const simplified = this._simplifyRDP(closed, 14);
+
+    const line = this._fitLine(closed);
+    if (line) return line;
+
+    const tri = this._fitTriangle(simplified);
+    if (tri) return { pts: tri, open: false, noFill: false };
+
+    const rect = this._fitRectangle(simplified);
+    if (rect) return { pts: rect, open: false, noFill: false };
+
+    const circle = this._fitCircle(closed);
+    if (circle) return { pts: circle, open: false, noFill: false };
+
+    return { pts: this._smoothClosed(closed), open: false, noFill: false };
+  }
+
+  _fitLine(closed) {
+    const pts = closed.slice(0, -1);
+    if (pts.length < 2) return null;
+
+    let a = pts[0];
+    let b = pts[pts.length - 1];
+    let maxD = -1;
+    for (let i = 0; i < pts.length; i++) {
+      for (let j = i + 1; j < pts.length; j++) {
+        const d = Math.hypot(pts[j].x - pts[i].x, pts[j].y - pts[i].y);
+        if (d > maxD) {
+          maxD = d;
+          a = pts[i];
+          b = pts[j];
+        }
+      }
+    }
+    if (maxD < Config.MIN_MOVE * 3) return null;
+
+    const vx = b.x - a.x;
+    const vy = b.y - a.y;
+    const len = Math.hypot(vx, vy);
+    if (!len) return null;
+
+    const avgErr = pts.reduce((acc, p) => {
+      const wx = p.x - a.x;
+      const wy = p.y - a.y;
+      const area2 = Math.abs(vx * wy - vy * wx);
+      return acc + (area2 / len);
+    }, 0) / pts.length;
+
+    if (avgErr > Config.LINE_SNAP_MAX_ERR) return null;
+    return {
+      pts: [{ x: a.x, y: a.y }, { x: b.x, y: b.y }],
+      open: true,
+      noFill: true,
+    };
+  }
+
+  _prepareClosed(pts) {
+    if (!pts.length) return [];
+    const out = pts.map(p => ({ x: p.x, y: p.y }));
+    const first = out[0];
+    const last = out[out.length - 1];
+    if (Math.hypot(last.x - first.x, last.y - first.y) > Config.MIN_MOVE) {
+      out.push({ x: first.x, y: first.y });
+    }
+    return out;
+  }
+
+  _smoothClosed(pts) {
+    const closed = this._prepareClosed(pts);
+    if (closed.length < 4) return closed;
+    let work = closed.slice(0, -1);
+    for (let iter = 0; iter < 2; iter++) {
+      const next = [];
+      for (let i = 0; i < work.length; i++) {
+        const p0 = work[i];
+        const p1 = work[(i + 1) % work.length];
+        next.push({
+          x: p0.x * 0.75 + p1.x * 0.25,
+          y: p0.y * 0.75 + p1.y * 0.25,
+        });
+        next.push({
+          x: p0.x * 0.25 + p1.x * 0.75,
+          y: p0.y * 0.25 + p1.y * 0.75,
+        });
+      }
+      work = next;
+    }
+    work.push({ ...work[0] });
+    return work;
+  }
+
+  _fitTriangle(simplified) {
+    if (simplified.length !== 3) return null;
+    return this._prepareClosed(simplified);
+  }
+
+  _fitRectangle(simplified) {
+    if (simplified.length !== 4) return null;
+
+    const pts = simplified;
+    const rightish = (a, b, c) => {
+      const v1x = a.x - b.x, v1y = a.y - b.y;
+      const v2x = c.x - b.x, v2y = c.y - b.y;
+      const l1 = Math.hypot(v1x, v1y);
+      const l2 = Math.hypot(v2x, v2y);
+      if (!l1 || !l2) return false;
+      const cos = Math.abs((v1x * v2x + v1y * v2y) / (l1 * l2));
+      return cos < 0.35;
+    };
+
+    for (let i = 0; i < 4; i++) {
+      const a = pts[(i + 3) % 4];
+      const b = pts[i];
+      const c = pts[(i + 1) % 4];
+      if (!rightish(a, b, c)) return null;
+    }
+    return this._prepareClosed(pts);
+  }
+
+  _fitCircle(closed) {
+    const pts = closed.slice(0, -1);
+    if (pts.length < 6) return null;
+    const center = pts.reduce((acc, p) => ({
+      x: acc.x + p.x / pts.length,
+      y: acc.y + p.y / pts.length,
+    }), { x: 0, y: 0 });
+    const rs = pts.map(p => Math.hypot(p.x - center.x, p.y - center.y));
+    const rAvg = rs.reduce((a, b) => a + b, 0) / rs.length;
+    if (rAvg < 8) return null;
+    const variance = rs.reduce((a, r) => a + Math.pow(r - rAvg, 2), 0) / rs.length;
+    const normStd = Math.sqrt(variance) / rAvg;
+    if (normStd > 0.2) return null;
+
+    const out = [];
+    for (let i = 0; i <= Config.CIRCLE_SEGMENTS; i++) {
+      const t = (i / Config.CIRCLE_SEGMENTS) * Math.PI * 2;
+      out.push({
+        x: center.x + Math.cos(t) * rAvg,
+        y: center.y + Math.sin(t) * rAvg,
+      });
+    }
+    return out;
+  }
+
+  _simplifyRDP(pts, epsilon) {
+    if (pts.length <= 3) return pts.slice(0, -1);
+    const open = pts.slice(0, -1);
+
+    const distToSegment = (p, a, b) => {
+      const vx = b.x - a.x, vy = b.y - a.y;
+      const wx = p.x - a.x, wy = p.y - a.y;
+      const c1 = vx * wx + vy * wy;
+      if (c1 <= 0) return Math.hypot(wx, wy);
+      const c2 = vx * vx + vy * vy;
+      if (c2 <= c1) return Math.hypot(p.x - b.x, p.y - b.y);
+      const t = c1 / c2;
+      const px = a.x + t * vx, py = a.y + t * vy;
+      return Math.hypot(p.x - px, p.y - py);
+    };
+
+    const rdp = arr => {
+      if (arr.length < 3) return arr;
+      const start = arr[0];
+      const end = arr[arr.length - 1];
+      let maxD = -1;
+      let idx = -1;
+      for (let i = 1; i < arr.length - 1; i++) {
+        const d = distToSegment(arr[i], start, end);
+        if (d > maxD) { maxD = d; idx = i; }
+      }
+      if (maxD > epsilon) {
+        const left = rdp(arr.slice(0, idx + 1));
+        const right = rdp(arr.slice(idx));
+        return left.slice(0, -1).concat(right);
+      }
+      return [start, end];
+    };
+
+    const simplified = rdp(open);
+    if (simplified.length > 8) return simplified.slice(0, 8);
+    return simplified;
   }
 
   // ─── Cursor renderer ─────────────────────────────────────
